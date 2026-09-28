@@ -1,0 +1,62 @@
+#!/bin/bash
+# btinternal - turn the laptop's built-in Bluetooth on/off (bt-dongle-fix)
+# Usage: sudo btinternal {on|off|status}
+set -u
+
+CONF=/etc/bt-dongle-fix.conf
+RULE=/etc/udev/rules.d/99-disable-internal-bt.rules
+
+INTERNAL=""
+[ -f "$CONF" ] && . "$CONF"
+[ -n "$INTERNAL" ] || { echo "Not installed ($CONF missing). Run install.sh first."; exit 1; }
+
+attr() { cat "$1/$2" 2>/dev/null || true; }
+
+# Each entry is VID:PID:PORT. Prefer the recorded port; fall back to any
+# non-removable device with the same VID:PID (ports can change after a
+# BIOS/firmware update).
+find_dev() {
+    local v=$1 p=$2 port=$3 d
+    d=/sys/bus/usb/devices/$port
+    if [ "$(attr "$d" idVendor):$(attr "$d" idProduct)" = "$v:$p" ]; then echo "$d"; return 0; fi
+    for d in /sys/bus/usb/devices/[0-9]*-[0-9]*; do
+        case "$d" in *:*) continue ;; esac
+        [ "$(attr "$d" idVendor):$(attr "$d" idProduct)" = "$v:$p" ] || continue
+        [ "$(attr "$d" removable)" = "removable" ] && continue
+        echo "$d"; return 0
+    done
+    return 1
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    on|off) [ "$(id -u)" -eq 0 ] || { echo "Needs sudo."; exit 1; } ;;
+    status) ;;
+    *) echo "Usage: sudo btinternal {on|off|status}"; exit 1 ;;
+esac
+
+for e in $INTERNAL; do
+    IFS=: read -r v p port <<< "$e"
+    if ! d=$(find_dev "$v" "$p" "$port"); then
+        echo "Built-in $v:$p not found."; continue
+    fi
+    case "$cmd" in
+        off) echo 0 > "$d/authorized"; echo "Built-in Bluetooth OFF ($v:$p, port $(basename "$d"))." ;;
+        on)  echo 1 > "$d/authorized"; echo "Built-in Bluetooth ON  ($v:$p, port $(basename "$d"))."
+             [ -f "$RULE" ] && echo "Note: it turns off again after reboot/replug (udev rule still installed)." ;;
+        status)
+             if [ "$(attr "$d" authorized)" = "1" ]; then s="ON "; else s="OFF"; fi
+             echo "Built-in Bluetooth : $s ($v:$p, port $(basename "$d"))" ;;
+    esac
+done
+
+if [ "$cmd" = "status" ]; then
+    [ -f "$RULE" ] && echo "udev rule          : installed (off on every boot)" \
+                   || echo "udev rule          : NOT installed"
+    mode=$(grep -E '^\s*ControllerMode\s*=' /etc/bluetooth/main.conf 2>/dev/null | tail -1 | sed 's/.*=\s*//')
+    echo "ControllerMode     : ${mode:-default (dual)}"
+    echo
+    echo "Controllers seen by BlueZ:"
+    out=$(bluetoothctl list 2>/dev/null)
+    [ -n "$out" ] && echo "$out" | sed 's/^/  /' || echo "  (none - is the dongle plugged in?)"
+fi

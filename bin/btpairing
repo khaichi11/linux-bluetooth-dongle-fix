@@ -1,0 +1,54 @@
+#!/bin/bash
+# btpairing - back up / restore Bluetooth pairings (bt-dongle-fix)
+#
+# Pairing keys live in /var/lib/bluetooth/<ADAPTER-MAC>/<DEVICE-MAC>/.
+# A reinstall wipes them, so every keyboard/mouse/headset must be paired
+# again. Back them up first and restore after reinstalling: the keys are
+# tied to the dongle's MAC, so it works as long as you keep the same dongle.
+#
+# Usage:
+#   sudo btpairing backup  [FILE]   default: ./bt-pairing-YYYYMMDD.tar.gz
+#   sudo btpairing restore FILE
+#   sudo btpairing list
+#
+# WARNING: the archive contains encryption keys. Keep it private.
+# Never commit it to git or upload it anywhere public.
+set -euo pipefail
+
+SRC=/var/lib/bluetooth
+[ "$(id -u)" -eq 0 ] || { echo "Needs sudo."; exit 1; }
+
+case "${1:-}" in
+    backup)
+        out="${2:-bt-pairing-$(date +%Y%m%d).tar.gz}"
+        [ -d "$SRC" ] || { echo "$SRC does not exist."; exit 1; }
+        umask 077
+        tar -C /var/lib -czf "$out" bluetooth
+        # hand the file to the user who ran sudo, so they can copy it
+        [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER:" "$out"
+        chmod 600 "$out"
+        echo "Saved: $out  (private keys inside - keep it safe)"
+        ;;
+    restore)
+        in="${2:-}"
+        [ -f "$in" ] || { echo "Usage: sudo btpairing restore FILE"; exit 1; }
+        tar -tzf "$in" | grep -qv '^bluetooth/' && { echo "Not a btpairing archive."; exit 1; }
+        systemctl stop bluetooth
+        tar -C /var/lib -xzf "$in"
+        chown -R root:root "$SRC"
+        chmod 700 "$SRC"
+        systemctl start bluetooth
+        echo "Restored. Paired devices:"
+        sleep 2
+        bluetoothctl devices Paired 2>/dev/null | sed 's/^/  /' || true
+        ;;
+    list)
+        bluetoothctl list
+        echo
+        bluetoothctl devices Paired
+        ;;
+    *)
+        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac

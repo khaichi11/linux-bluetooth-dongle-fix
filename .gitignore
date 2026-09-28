@@ -1,0 +1,3 @@
+# Pairing backups contain Bluetooth encryption keys - never commit them
+bt-pairing*.tar.gz
+*.tar.gz
