@@ -134,3 +134,7 @@ Sudah mencobanya di distro atau chip lain? Buka issue atau PR untuk menambahkann
 ## Lisensi
 
 [MIT](LICENSE)
+
+## Merek dagang
+
+Bluetooth adalah merek dagang terdaftar milik Bluetooth SIG, Inc. Linux adalah merek dagang terdaftar milik Linus Torvalds. Ubuntu adalah merek dagang terdaftar milik Canonical Ltd. Nama produk dan perusahaan lain adalah merek dagang milik pemiliknya masing-masing dan disebut di sini hanya untuk menjelaskan kompatibilitas. Proyek ini tidak berafiliasi dengan maupun didukung oleh pihak-pihak tersebut.

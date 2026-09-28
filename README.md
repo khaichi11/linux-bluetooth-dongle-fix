@@ -134,3 +134,7 @@ Tested it on another distro or chip? Open an issue or PR to add it here.
 ## License
 
 [MIT](LICENSE)
+
+## Trademarks
+
+Bluetooth is a registered trademark of Bluetooth SIG, Inc. Linux is a registered trademark of Linus Torvalds. Ubuntu is a registered trademark of Canonical Ltd. All other product and company names are trademarks of their respective owners and are used here only to describe compatibility. This project is not affiliated with or endorsed by any of them.
