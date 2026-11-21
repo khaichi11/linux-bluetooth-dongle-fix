@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 khaichi11
+"""
+btdualboot - keep Bluetooth devices paired in both Windows and Linux (bt-dongle-fix)
+
+A device stores ONE pairing key per host. Pairing it in Windows replaces the
+key Linux knows, and the other way round, so you end up pairing again every
+time you switch OS. btdualboot copies the keys Windows has into Linux, so both
+systems use the same key and the device works in both without re-pairing.
+
+Direction: Windows -> Linux.
+  * The Windows registry is only READ (the partition may be mounted read-only).
+  * Only /var/lib/bluetooth/<adapter>/<device>/info on Linux is changed.
+  * /var/lib/bluetooth is backed up (.tar.gz) before anything is written.
+  * Without --apply it only shows what it would change.
+  * Needs nothing but Python 3.6+.
+
+Steps:
+  1. Linux:   pair the keyboard/mouse.
+  2. Windows: pair the same devices again, then shut down fully
+              (disable Fast Startup, or hold Shift while clicking Shut down).
+  3. Linux:   sudo btdualboot           (preview)
+              sudo btdualboot --apply   (write)
+  Pair again in either OS later? Repeat steps 2-3.
+
+Undo:
+  sudo btdualboot --restore /var/backups/bt-dongle-fix/dualboot/<file>.tar.gz
+"""
+
+import argparse
+import configparser
+import datetime
+import glob
+import io
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+VERSION = "1.0.0"
+DEFAULT_BT_DIR = "/var/lib/bluetooth"
+DEFAULT_BACKUP_DIR = "/var/backups/bt-dongle-fix/dualboot"
+MAC12_RE = re.compile(r"^[0-9a-fA-F]{12}$")
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+# --------------------------------------------------------------------------
+# Read-only parser for Windows registry hive files ("regf"), no dependencies
+# --------------------------------------------------------------------------
+
+class HiveError(Exception):
+    pass
+
+
+class Hive:
+    HBIN_START = 4096
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self.data = f.read()
+        if len(self.data) < self.HBIN_START or self.data[:4] != b"regf":
+            raise HiveError("%s is not a registry hive file" % path)
+        seq_primary, seq_secondary = struct.unpack_from("<II", self.data, 4)
+        # Different sequence numbers = changes not yet written to the main file
+        # (Fast Startup / hibernation / unclean shutdown).
+        self.dirty = seq_primary != seq_secondary
+        self.root = struct.unpack_from("<I", self.data, 0x24)[0]
+
+    def _cell(self, off):
+        pos = self.HBIN_START + off
+        if off == 0xFFFFFFFF or pos + 4 > len(self.data):
+            raise HiveError("invalid cell offset 0x%x" % off)
+        size = abs(struct.unpack_from("<i", self.data, pos)[0])
+        if size < 8 or pos + size > len(self.data):
+            raise HiveError("invalid cell size at 0x%x" % off)
+        return self.data[pos + 4:pos + size]
+
+    def _nk(self, off):
+        c = self._cell(off)
+        if c[:2] != b"nk" or len(c) < 0x4C:
+            raise HiveError("corrupt key record at 0x%x" % off)
+        flags = struct.unpack_from("<H", c, 0x02)[0]
+        n_sub = struct.unpack_from("<I", c, 0x14)[0]
+        sub_list = struct.unpack_from("<I", c, 0x1C)[0]
+        n_val = struct.unpack_from("<I", c, 0x24)[0]
+        val_list = struct.unpack_from("<I", c, 0x28)[0]
+        name_len = struct.unpack_from("<H", c, 0x48)[0]
+        raw = c[0x4C:0x4C + name_len]
+        name = raw.decode("latin-1") if flags & 0x20 else raw.decode("utf-16-le", "replace")
+        return {"name": name, "n_sub": n_sub, "sub_list": sub_list,
+                "n_val": n_val, "val_list": val_list}
+
+    def _subkey_offsets(self, list_off, depth=0):
+        if depth > 4:
+            raise HiveError("subkey list nested too deep")
+        c = self._cell(list_off)
+        sig = c[:2]
+        n = struct.unpack_from("<H", c, 2)[0]
+        if sig in (b"lf", b"lh"):
+            return [struct.unpack_from("<I", c, 4 + i * 8)[0] for i in range(n)]
+        if sig == b"li":
+            return [struct.unpack_from("<I", c, 4 + i * 4)[0] for i in range(n)]
+        if sig == b"ri":
+            out = []
+            for i in range(n):
+                out.extend(self._subkey_offsets(struct.unpack_from("<I", c, 4 + i * 4)[0], depth + 1))
+            return out
+        raise HiveError("unknown subkey list type %r" % sig)
+
+    def subkeys(self, nk_off):
+        """{lowercase_name: (name, offset)}"""
+        nk = self._nk(nk_off)
+        if nk["n_sub"] == 0 or nk["sub_list"] == 0xFFFFFFFF:
+            return {}
+        out = {}
+        for off in self._subkey_offsets(nk["sub_list"]):
+            name = self._nk(off)["name"]
+            out[name.lower()] = (name, off)
+        return out
+
+    def values(self, nk_off):
+        """{lowercase_name: (name, type, bytes)}"""
+        nk = self._nk(nk_off)
+        out = {}
+        if nk["n_val"] == 0 or nk["val_list"] == 0xFFFFFFFF:
+            return out
+        lst = self._cell(nk["val_list"])
+        for i in range(nk["n_val"]):
+            v_off = struct.unpack_from("<I", lst, i * 4)[0]
+            v = self._cell(v_off)
+            if v[:2] != b"vk" or len(v) < 0x14:
+                continue
+            name_len, d_size, d_off, d_type, v_flags = struct.unpack_from("<HIIIH", v, 2)
+            raw = v[0x14:0x14 + name_len]
+            name = raw.decode("latin-1") if v_flags & 1 else raw.decode("utf-16-le", "replace")
+            if d_size & 0x80000000:          # small data is stored in the offset field
+                data = struct.pack("<I", d_off)[:d_size & 0x7FFFFFFF]
+            elif d_size == 0:
+                data = b""
+            else:
+                cell = self._cell(d_off)
+                if d_size > 16344 and cell[:2] == b"db":
+                    continue                 # big data; never used for Bluetooth keys
+                data = cell[:d_size]
+            out[name.lower()] = (name, d_type, data)
+        return out
+
+    def find(self, path):
+        off = self.root
+        for part in [p for p in path.split("\\") if p]:
+            subs = self.subkeys(off)
+            if part.lower() not in subs:
+                return None
+            off = subs[part.lower()][1]
+        return off
+
+
+# --------------------------------------------------------------------------
+# Bluetooth keys from the Windows SYSTEM hive
+# --------------------------------------------------------------------------
+
+def fmt_mac(s):
+    s = re.sub(r"[^0-9a-fA-F]", "", s).upper()
+    if len(s) != 12:
+        raise ValueError("invalid MAC address %r" % s)
+    return ":".join(s[i:i + 2] for i in range(0, 12, 2))
+
+
+def read_windows_keys(hive):
+    current = 1
+    sel = hive.find("Select")
+    if sel is not None:
+        vals = hive.values(sel)
+        if "current" in vals and len(vals["current"][2]) >= 4:
+            current = struct.unpack("<I", vals["current"][2][:4])[0]
+    path = "ControlSet%03d\\Services\\BTHPORT\\Parameters\\Keys" % current
+    keys_off = hive.find(path)
+    if keys_off is None:
+        raise HiveError("%s not found. Was anything ever paired in Windows?" % path)
+
+    adapters = {}
+    for a_name, (_, a_off) in hive.subkeys(keys_off).items():
+        if not MAC12_RE.match(a_name):
+            continue
+        classic = {}
+        for v_name, (_, _, data) in hive.values(a_off).items():
+            if MAC12_RE.match(v_name) and len(data) == 16:
+                classic[fmt_mac(v_name)] = data
+        le = {}
+        for d_name, (_, d_off) in hive.subkeys(a_off).items():
+            if MAC12_RE.match(d_name):
+                le[fmt_mac(d_name)] = hive.values(d_off)
+        adapters[fmt_mac(a_name)] = {"classic": classic, "le": le}
+    return path, adapters
+
+
+def le_updates(vals, reverse_irk):
+    """Map the registry values of a BLE device to BlueZ info file fields."""
+    def raw(name):
+        v = vals.get(name.lower())
+        return v[2] if v else None
+
+    def number(name):
+        d = raw(name)
+        return None if d is None else str(int.from_bytes(d, "little"))
+
+    upd = {}
+    ltk = raw("LTK")
+    if ltk and len(ltk) == 16:
+        sec = {"Key": ltk.hex().upper()}
+        for win_name, bz_name in (("KeyLength", "EncSize"), ("EDIV", "EDiv"), ("ERand", "Rand")):
+            n = number(win_name)
+            if n is not None:
+                sec[bz_name] = n
+        upd["LongTermKey"] = sec
+    irk = raw("IRK")
+    if irk and len(irk) == 16:
+        upd["IdentityResolvingKey"] = {"Key": (irk[::-1] if reverse_irk else irk).hex().upper()}
+    return upd
+
+
+# --------------------------------------------------------------------------
+# BlueZ info files
+# --------------------------------------------------------------------------
+
+def load_info(path):
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        cp.read_file(f)
+    return cp
+
+
+def save_info(cp, path):
+    buf = io.StringIO()
+    cp.write(buf, space_around_delimiters=False)
+    text = buf.getvalue().rstrip("\n") + "\n"
+    tmp = path + ".btdualboot.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
+    try:
+        st = os.stat(path)
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def apply_updates(cp, updates):
+    for sec, kv in updates.items():
+        if not cp.has_section(sec):
+            cp.add_section(sec)
+            if sec == "LongTermKey":
+                cp.set(sec, "Authenticated", "0")
+        for k, v in kv.items():
+            cp.set(sec, k, v)
+
+
+def diff_updates(cp, updates):
+    changed = []
+    for sec, kv in updates.items():
+        for k, v in kv.items():
+            old = cp.get(sec, k, fallback=None)
+            if old != v:
+                changed.append((sec, k, old, v))
+    return changed
+
+
+# --------------------------------------------------------------------------
+# Plan
+# --------------------------------------------------------------------------
+
+class Item:
+    def __init__(self, adapter, win_mac, kind, updates):
+        self.adapter = adapter
+        self.win_mac = win_mac
+        self.kind = kind            # "Classic" / "BLE"
+        self.updates = updates
+        self.linux_mac = None       # old folder name when renaming
+        self.status = None          # update / same / missing / rename
+        self.changes = []
+        self.suggest = []
+        self.name = ""
+
+
+def linux_devices(bt_dir, adapter):
+    d = os.path.join(bt_dir, adapter)
+    try:
+        return sorted(e for e in os.listdir(d)
+                      if MAC_RE.match(e) and os.path.isfile(os.path.join(d, e, "info")))
+    except OSError:
+        return []
+
+
+def device_name(info_path):
+    try:
+        return load_info(info_path).get("General", "Name", fallback="")
+    except Exception:
+        return ""
+
+
+def build_plan(win, bt_dir, maps, reverse_irk):
+    items, warnings = [], []
+    linux_adapters = [e for e in (os.listdir(bt_dir) if os.path.isdir(bt_dir) else [])
+                      if MAC_RE.match(e)]
+    for adapter, data in sorted(win.items()):
+        if adapter not in linux_adapters:
+            warnings.append("Adapter %s exists in Windows but not in Linux (Linux adapters: %s). "
+                            "Use the same dongle in both systems." %
+                            (adapter, ", ".join(linux_adapters) or "none"))
+            continue
+        entries = [Item(adapter, m, "Classic", {"LinkKey": {"Key": k.hex().upper()}})
+                   for m, k in data["classic"].items()]
+        for m, vals in data["le"].items():
+            upd = le_updates(vals, reverse_irk)
+            if upd:
+                entries.append(Item(adapter, m, "BLE", upd))
+        win_macs = {e.win_mac for e in entries}
+        lin_devs = linux_devices(bt_dir, adapter)
+        for it in sorted(entries, key=lambda e: e.win_mac):
+            target = os.path.join(bt_dir, adapter, it.win_mac, "info")
+            src_mac = maps.get(it.win_mac)
+            if src_mac:
+                src = os.path.join(bt_dir, adapter, src_mac, "info")
+                if not os.path.isfile(src):
+                    warnings.append("--map %s=%s: Linux folder %s not found." %
+                                    (it.win_mac, src_mac, src_mac))
+                    continue
+                if os.path.exists(os.path.join(bt_dir, adapter, it.win_mac)):
+                    warnings.append("--map %s=%s: folder %s already exists, cannot rename." %
+                                    (it.win_mac, src_mac, it.win_mac))
+                    continue
+                it.linux_mac = src_mac
+                it.status = "rename"
+                it.name = device_name(src)
+                it.changes = diff_updates(load_info(src), it.updates)
+            elif os.path.isfile(target):
+                it.name = device_name(target)
+                it.changes = diff_updates(load_info(target), it.updates)
+                it.status = "update" if it.changes else "same"
+            else:
+                it.status = "missing"
+                # BLE devices often get a new address on every pairing,
+                # usually only the last byte changes.
+                it.suggest = [(d, device_name(os.path.join(bt_dir, adapter, d, "info")))
+                              for d in lin_devs
+                              if d not in win_macs and d[:14] == it.win_mac[:14]]
+            items.append(it)
+    return items, warnings
+
+
+def mask(v, show):
+    if v is None:
+        return "(none)"
+    if show or len(v) <= 8:
+        return v
+    return v[:4] + "..." + v[-2:]
+
+
+def print_plan(items, warnings, show_keys):
+    label = {"update": "WILL UPDATE", "same": "already in sync",
+             "missing": "NOT PAIRED IN LINUX", "rename": "WILL RENAME + UPDATE"}
+    if not items:
+        print("No Bluetooth devices found in the Windows registry.")
+    for it in items:
+        nm = (" \"%s\"" % it.name) if it.name else ""
+        print("\n[%s] %s%s  (adapter %s)  ->  %s" %
+              (it.kind, it.win_mac, nm, it.adapter, label[it.status]))
+        if it.status == "rename":
+            print("    Linux folder %s  ->  %s" % (it.linux_mac, it.win_mac))
+        for sec, k, old, new in it.changes:
+            print("    [%s] %s: %s  ->  %s" % (sec, k, mask(old, show_keys), mask(new, show_keys)))
+        if it.status == "missing":
+            if it.suggest:
+                for d, n in it.suggest:
+                    print("    Probably the same device in Linux: %s%s" %
+                          (d, (" \"%s\"" % n) if n else ""))
+                    print("    -> run again with:  --map %s=%s" % (it.win_mac, d))
+            else:
+                print("    Pair it in Linux first, or use --map WINDOWS_MAC=LINUX_MAC.")
+    for w in warnings:
+        print("\nWARNING: " + w)
+
+
+# --------------------------------------------------------------------------
+# Finding / mounting the Windows partition (read-only)
+# --------------------------------------------------------------------------
+
+def hive_under(root):
+    cur = root
+    for part in ("windows", "system32", "config", "system"):
+        try:
+            entries = os.listdir(cur)
+        except OSError:
+            return None
+        match = [e for e in entries if e.lower() == part]
+        if not match:
+            return None
+        cur = os.path.join(cur, match[0])
+    return cur if os.path.isfile(cur) else None
+
+
+def find_mounted_hives():
+    found = set()
+    for pattern in ("/media/*/*", "/media/*", "/run/media/*/*", "/mnt/*", "/mnt"):
+        for root in glob.glob(pattern):
+            h = hive_under(root)
+            if h:
+                found.add(os.path.realpath(h))
+    return sorted(found)
+
+
+def automount_hives():
+    """Mount every unmounted NTFS partition read-only and look for the SYSTEM hive."""
+    mounted = []   # (device, mountpoint, hive)
+    try:
+        out = subprocess.run(["lsblk", "-rpno", "NAME,FSTYPE,MOUNTPOINT"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return mounted
+    for line in out.splitlines():
+        parts = line.split(" ")
+        if len(parts) < 2 or parts[1].lower() not in ("ntfs", "ntfs3"):
+            continue
+        if len(parts) >= 3 and parts[2]:
+            continue
+        dev = parts[0]
+        mp = tempfile.mkdtemp(prefix="btdualboot-")
+        ok = False
+        for cmd in (["mount", "-o", "ro", dev, mp], ["mount", "-t", "ntfs-3g", "-o", "ro", dev, mp]):
+            if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                ok = True
+                break
+        h = hive_under(mp) if ok else None
+        if h:
+            mounted.append((dev, mp, h))
+        else:
+            if ok:
+                subprocess.run(["umount", mp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.rmdir(mp)
+    return mounted
+
+
+def unmount_all(mounted):
+    for _, mp, _ in mounted:
+        subprocess.run(["umount", mp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.rmdir(mp)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# bluetooth service, backup, restore
+# --------------------------------------------------------------------------
+
+def service_active():
+    if not shutil.which("systemctl"):
+        return False
+    return subprocess.run(["systemctl", "is-active", "--quiet", "bluetooth"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def service(action):
+    if shutil.which("systemctl"):
+        if subprocess.run(["systemctl", action, "bluetooth"]).returncode != 0:
+            print("WARNING: 'systemctl %s bluetooth' failed." % action)
+
+
+def make_backup(bt_dir, backup_dir):
+    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(backup_dir, "bluetooth-%s.tar.gz" % stamp)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f, tarfile.open(fileobj=f, mode="w:gz") as tar:
+        tar.add(bt_dir, arcname="bluetooth")
+    return path
+
+
+def restore_backup(archive, bt_dir):
+    with tarfile.open(archive, "r:gz") as tar:
+        for m in tar.getmembers():
+            if not (m.name == "bluetooth" or m.name.startswith("bluetooth/")) \
+                    or ".." in m.name.split("/") or m.issym() or m.islnk():
+                sys.exit("Unexpected entry in backup (%s), restore aborted." % m.name)
+        was_active = service_active()
+        if was_active:
+            service("stop")
+        parent = os.path.dirname(os.path.abspath(bt_dir.rstrip("/")))
+        old = bt_dir.rstrip("/") + ".before-restore"
+        if os.path.exists(old):
+            shutil.rmtree(old)
+        os.rename(bt_dir, old)
+        tmp = tempfile.mkdtemp(dir=parent)
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(tmp, filter="data")
+        else:
+            tar.extractall(tmp)
+        os.rename(os.path.join(tmp, "bluetooth"), bt_dir)
+        os.rmdir(tmp)
+        os.chmod(bt_dir, 0o700)
+    if was_active:
+        service("start")
+    print("Restored. The state before the restore is kept in %s" % old)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="btdualboot",
+        description="Copy Bluetooth pairing keys from Windows to Linux (dual boot). "
+                    "The Windows registry is only read. Without --apply nothing is changed.")
+    p.add_argument("--apply", action="store_true", help="write the changes")
+    p.add_argument("--hive", help="Windows SYSTEM hive "
+                                  "(e.g. /mnt/win/Windows/System32/config/SYSTEM)")
+    p.add_argument("--no-automount", action="store_true",
+                   help="do not mount NTFS partitions (read-only) to look for the hive")
+    p.add_argument("--map", action="append", default=[], metavar="WINMAC=LINUXMAC",
+                   help="device whose address changed: rename Linux folder LINUXMAC to WINMAC")
+    p.add_argument("--reverse-irk", action="store_true",
+                   help="reverse the IRK byte order (try this if a BLE device still won't connect)")
+    p.add_argument("--force", action="store_true",
+                   help="apply even if the Windows hive was not flushed")
+    p.add_argument("--show-keys", action="store_true", help="print full keys (masked by default)")
+    p.add_argument("--no-restart", action="store_true", help="do not stop/start the bluetooth service")
+    p.add_argument("--bt-dir", default=DEFAULT_BT_DIR, help=argparse.SUPPRESS)
+    p.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR,
+                   help="backup folder (default %s)" % DEFAULT_BACKUP_DIR)
+    p.add_argument("--restore", metavar="BACKUP.tar.gz", help="restore /var/lib/bluetooth from a backup")
+    p.add_argument("--version", action="version", version="btdualboot " + VERSION)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    bt_dir = args.bt_dir
+    writing = args.apply or args.restore
+
+    if not os.access(bt_dir, os.R_OK | os.X_OK) or (writing and not os.access(bt_dir, os.W_OK)):
+        sys.exit("Cannot access %s. Run with sudo." % bt_dir)
+
+    if args.restore:
+        restore_backup(args.restore, bt_dir)
+        return
+
+    maps = {}
+    for m in args.map:
+        try:
+            w, l = m.split("=", 1)
+            maps[fmt_mac(w)] = fmt_mac(l)
+        except ValueError:
+            sys.exit("Bad --map %r (example: --map AA:BB:CC:DD:EE:02=AA:BB:CC:DD:EE:01)" % m)
+
+    # 1. Find the Windows hive
+    mounted = []
+    hive_path = args.hive
+    try:
+        if not hive_path:
+            hives = find_mounted_hives()
+            if not hives and not args.no_automount and os.geteuid() == 0:
+                mounted = automount_hives()
+                hives = [h for _, _, h in mounted]
+            if not hives:
+                sys.exit("Windows partition not found. Mount it (read-only is enough), e.g.:\n"
+                         "  sudo mkdir -p /mnt/win && sudo mount -o ro /dev/nvme0n1p3 /mnt/win\n"
+                         "then run again, or use --hive PATH.")
+            if len(hives) > 1:
+                sys.exit("More than one Windows found, pick one with --hive:\n  " + "\n  ".join(hives))
+            hive_path = hives[0]
+        print("Windows hive : %s" % hive_path)
+        hive = Hive(hive_path)       # read fully into memory, the file is never written
+    finally:
+        unmount_all(mounted)
+
+    # 2. Read the keys
+    reg_path, win = read_windows_keys(hive)
+    print("Registry     : SYSTEM\\%s" % reg_path)
+    if hive.dirty:
+        print("\nWARNING: the Windows hive was not flushed (Fast Startup / hibernation / unclean\n"
+              "shutdown), so the newest pairing keys may be missing. Boot Windows, disable Fast\n"
+              "Startup, then hold Shift while clicking Shut down. Or use --force.")
+
+    # 3. Plan
+    items, warnings = build_plan(win, bt_dir, maps, args.reverse_irk)
+    print_plan(items, warnings, args.show_keys)
+    todo = [it for it in items if it.status in ("update", "rename")]
+
+    if not todo:
+        print("\nNothing to change.")
+        return
+    if not args.apply:
+        print("\nPreview only, nothing was changed. Run again with --apply to write.")
+        return
+    if hive.dirty and not args.force:
+        sys.exit("\nAborted: the Windows hive was not flushed (see the warning above).")
+
+    # 4. Apply
+    backup = make_backup(bt_dir, args.backup_dir)
+    print("\nBackup       : %s" % backup)
+    restart = not args.no_restart and service_active()
+    if restart:
+        service("stop")      # bluetoothd may rewrite info files when it exits
+    try:
+        for it in todo:
+            adir = os.path.join(bt_dir, it.adapter)
+            if it.status == "rename":
+                os.rename(os.path.join(adir, it.linux_mac), os.path.join(adir, it.win_mac))
+                old_cache = os.path.join(adir, "cache", it.linux_mac)
+                new_cache = os.path.join(adir, "cache", it.win_mac)
+                if os.path.exists(old_cache) and not os.path.exists(new_cache):
+                    os.rename(old_cache, new_cache)
+            info = os.path.join(adir, it.win_mac, "info")
+            cp = load_info(info)
+            apply_updates(cp, it.updates)
+            save_info(cp, info)
+            print("OK           : %s %s" % (it.win_mac, it.name))
+    except Exception as e:
+        print("\nFAILED: %s\nUndo with: sudo btdualboot --restore %s" % (e, backup))
+        raise
+    finally:
+        if restart:
+            service("start")
+    print("\nDone. If a device doesn't reconnect, switch it off and on once.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except HiveError as e:
+        sys.exit("Error reading the Windows registry: %s" % e)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -4,6 +4,7 @@
 #   1. Disable the laptop's built-in Bluetooth chip (udev, survives reboot)
 #   2. Enable Bluetooth Low Energy: ControllerMode = dual in BlueZ
 #   3. Retire old "btmgmt le on" udev hacks that race with bluetoothd
+#   4. Install helper commands: btinternal, btpairing, btdualboot
 #
 # Usage:
 #   sudo ./install.sh                     auto-detect the built-in chip
@@ -26,7 +27,7 @@ while [ $# -gt 0 ]; do
         --dry-run)  DRY=1 ;;
         --yes|-y)   YES=1 ;;
         --internal) WANT="${2:-}"; shift ;;
-        -h|--help)  sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)"; exit 1 ;;
     esac
     shift
@@ -153,12 +154,13 @@ echo "$RULE_TEXT" > "$RULE"
 chmod 0644 "$RULE"
 install -m 0755 "$HERE/bin/btinternal" /usr/local/bin/btinternal
 install -m 0755 "$HERE/bin/btpairing"  /usr/local/bin/btpairing
+install -m 0755 "$HERE/bin/btdualboot" /usr/local/bin/btdualboot
 cat > "$CONF" <<EOF
 # bt-dongle-fix state (used by btinternal and uninstall.sh)
 INTERNAL="${ENTRIES% }"
 BACKUP_DIR="$BK"
 EOF
-echo "[2/5] udev rule + 'btinternal' and 'btpairing' commands installed."
+echo "[2/5] udev rule + 'btinternal', 'btpairing' and 'btdualboot' commands installed."
 
 # --- 4. BlueZ: dual mode (BR/EDR + LE) -----------------------------------
 if [ ! -f "$MAIN" ]; then

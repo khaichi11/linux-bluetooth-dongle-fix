@@ -149,6 +149,25 @@ rfkill list bluetooth     # "Soft blocked: yes" -> rfkill unblock bluetooth
 
 ---
 
+## 11. Dual boot: devices must be paired again after switching between Windows and Linux
+
+**Symptom:** The keyboard/mouse works in Windows, but after booting Linux it won't connect until you pair it again, and then it stops working in Windows.
+
+**Cause:** The device stores one key per computer. Both systems use the same dongle (same MAC), so the device sees them as one computer, but each system made its own key during pairing. Whichever system paired last wins.
+
+**Fix:** Pair in Linux, then in Windows, shut Windows down fully (Shift + Shut down), and run `sudo btdualboot --apply` in Linux. See [Dual boot with Windows](../README.md#dual-boot-with-windows-pair-once-use-in-both).
+
+**Check:**
+```bash
+sudo btdualboot     # every device should say "already in sync"
+```
+
+- `WARNING: the Windows hive was not flushed`: Windows hibernated (Fast Startup) instead of shutting down. Disable Fast Startup and shut down with Shift held.
+- `Adapter ... exists in Windows but not in Linux`: Windows paired the device to a different adapter, usually the built-in one. Pair it to the dongle in Windows.
+- A BLE device still won't connect after `--apply`: run `sudo btdualboot --restore FILE` with the backup it printed, then try `sudo btdualboot --apply --reverse-irk`.
+
+---
+
 ## Useful commands
 
 | Command | Shows |

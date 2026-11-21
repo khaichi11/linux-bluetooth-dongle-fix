@@ -13,6 +13,7 @@ Seharusnya jalan di Ubuntu, Debian, Linux Mint, Pop!_OS, Fedora, Arch, dan distr
 - **Keyboard/mouse BLE tidak muncul** saat scan, atau **tersambung tapi tidak bisa mengetik**.
 - Kamu pernah mengikuti tutorial yang menyetel `ControllerMode = bredr` atau memasang skrip udev `btmgmt le on`, lalu Bluetooth jadi tidak stabil.
 - Kamu mau setup Bluetooth bisa dipasang lagi **dengan satu perintah setelah install ulang Linux**.
+- Kamu **dual boot Windows dan Linux**, dan harus pairing ulang keyboard/mouse setiap kali pindah OS.
 
 ## Mulai cepat
 
@@ -28,7 +29,7 @@ Colok dongle **sebelum** menjalankan installer. Yang dikerjakan installer:
 1. Mencari chip Bluetooth bawaan secara otomatis (perangkat Bluetooth USB di port `fixed`, alias tersolder) lalu mematikannya lewat aturan udev. Chip itu tetap mati setiap kali boot.
 2. Menyetel `ControllerMode = dual` di `/etc/bluetooth/main.conf` supaya Classic **dan** Low Energy sama-sama jalan.
 3. Mempensiunkan hack udev lama yang menjalankan `btmgmt`/`hciconfig`, karena hack itu balapan dengan `bluetoothd`.
-4. Memasang dua perintah bantu: `btinternal` dan `btpairing`.
+4. Memasang tiga perintah bantu: `btinternal`, `btpairing`, dan `btdualboot`.
 
 Semua perubahan dibackup ke `/var/backups/bt-dongle-fix/`. Untuk membatalkan semuanya: `sudo ./uninstall.sh`.
 
@@ -47,6 +48,9 @@ sudo ./install.sh --internal VID:PID
 | `sudo btinternal off` | Matikan lagi |
 | `sudo btpairing backup [FILE]` | Simpan semua pairing (kunci) ke berkas `.tar.gz` privat |
 | `sudo btpairing restore FILE` | Pulihkan pairing, misalnya setelah install ulang |
+| `sudo btdualboot` | Pratinjau penyalinan kunci pairing dari Windows (dual boot); tidak mengubah apa pun |
+| `sudo btdualboot --apply` | Salin kuncinya, supaya perangkat jalan di Windows dan Linux tanpa pairing ulang |
+| `sudo btdualboot --restore FILE` | Batalkan `--apply` dari backup otomatisnya |
 
 ## Setelah install ulang Linux
 
@@ -68,6 +72,37 @@ sudo btpairing restore ~/bt-pairing.tar.gz
 Kunci pairing terikat ke MAC address dongle, jadi restore hanya berhasil kalau kamu memakai **dongle yang sama**.
 
 > **Peringatan:** Berkas backup pairing berisi kunci enkripsi. Jangan di-commit dan jangan diunggah ke tempat publik. `.gitignore` sudah memblokir `bt-pairing*.tar.gz`.
+
+## Dual boot dengan Windows: pairing sekali, jalan di keduanya
+
+Perangkat Bluetooth hanya menyimpan **satu** kunci pairing per komputer. Windows dan Linux di laptop yang sama terlihat seperti satu komputer (dongle sama, MAC sama), tapi masing-masing membuat kuncinya sendiri. Akibatnya, pairing di satu OS membuat perangkat tidak nyambung di OS lainnya. `btdualboot` menyalin kunci buatan Windows ke Linux, supaya kedua OS memakai kunci yang sama.
+
+Registry Windows hanya **dibaca** (partisi Windows boleh tetap read-only). Yang diubah hanya file pairing di `/var/lib/bluetooth`, dan file itu di-backup dulu.
+
+1. **Linux:** pairing perangkat seperti biasa. Jangan dihapus setelahnya, karena `btdualboot` memperbarui data ini.
+2. **Windows:** pairing ulang perangkat yang sama (hapus dulu entri lamanya). Lalu matikan Windows sepenuhnya: matikan Fast Startup (*Control Panel > Power Options > Choose what the power buttons do*), atau tahan **Shift** sambil klik **Shut down**.
+3. **Linux:** perangkat belum akan nyambung, dan itu normal. Jalankan:
+
+```bash
+sudo btdualboot            # pratinjau: daftar perangkat dan apa yang akan berubah
+sudo btdualboot --apply    # terapkan (backup dulu, lalu restart bluetooth)
+```
+
+Belum dipasang lewat `install.sh`? Jalankan langsung dari folder repo: `sudo ./bin/btdualboot`. Cukup butuh Python 3.
+
+Partisi Windows dicari otomatis, dan di-mount read-only kalau perlu. Kalau tidak ketemu, pakai `--hive /path/ke/Windows/System32/config/SYSTEM`.
+
+**Mouse/keyboard BLE sering ganti alamat setiap pairing.** Pratinjau lalu menampilkan `NOT PAIRED IN LINUX` dan menyarankan entri Linux yang cocok:
+
+```
+[BLE] AA:BB:CC:DD:EE:02  (adapter 11:22:33:44:55:66)  ->  NOT PAIRED IN LINUX
+    Probably the same device in Linux: AA:BB:CC:DD:EE:01 "My Mouse"
+    -> run again with:  --map AA:BB:CC:DD:EE:02=AA:BB:CC:DD:EE:01
+```
+
+Tambahkan `--map` itu ke perintah `--apply`. Kalau satu perangkat muncul beberapa kali, berarti Windows masih menyimpan pairing lama: hapus perangkat itu di Windows, pairing sekali, lalu jalankan pratinjau lagi.
+
+Pakai **dongle yang sama** di kedua OS. Kunci terikat ke MAC adapter, jadi perangkat yang di-pairing ke Bluetooth bawaan di Windows tidak bisa dipindah ke dongle di Linux. Nanti pairing ulang di salah satu OS? Ulangi langkah 2-3.
 
 ## Cara pairing keyboard BLE yang benar
 

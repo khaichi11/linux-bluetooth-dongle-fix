@@ -34,7 +34,7 @@ for f in /etc/udev/rules.d/*.rules.disabled; do
     fi
 done
 
-rm -f /usr/local/bin/btinternal /usr/local/bin/btpairing "$CONF"
+rm -f /usr/local/bin/btinternal /usr/local/bin/btpairing /usr/local/bin/btdualboot "$CONF"
 
 udevadm control --reload-rules
 udevadm trigger --action=add --subsystem-match=usb

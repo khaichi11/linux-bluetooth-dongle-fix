@@ -149,6 +149,25 @@ rfkill list bluetooth     # "Soft blocked: yes" -> rfkill unblock bluetooth
 
 ---
 
+## 11. Dual boot: perangkat harus pairing ulang setiap pindah Windows ↔ Linux
+
+**Gejala:** Keyboard/mouse jalan di Windows, tapi setelah boot ke Linux tidak mau nyambung sampai di-pairing ulang. Setelah itu, giliran di Windows yang tidak jalan.
+
+**Penyebab:** Perangkat menyimpan satu kunci per komputer. Kedua OS memakai dongle yang sama (MAC sama), jadi perangkat menganggapnya satu komputer, padahal masing-masing OS membuat kuncinya sendiri saat pairing. OS yang terakhir melakukan pairing yang menang.
+
+**Solusi:** Pairing di Linux, lalu di Windows, matikan Windows sepenuhnya (Shift + Shut down), lalu jalankan `sudo btdualboot --apply` di Linux. Lihat [Dual boot dengan Windows](../README.id.md#dual-boot-dengan-windows-pairing-sekali-jalan-di-keduanya).
+
+**Cek:**
+```bash
+sudo btdualboot     # semua perangkat seharusnya "already in sync"
+```
+
+- `WARNING: the Windows hive was not flushed`: Windows hibernate (Fast Startup), bukan shutdown. Matikan Fast Startup dan shutdown sambil menahan Shift.
+- `Adapter ... exists in Windows but not in Linux`: di Windows, perangkat di-pairing ke adapter lain, biasanya Bluetooth bawaan. Pairing-kan ke dongle di Windows.
+- Perangkat BLE tetap tidak nyambung setelah `--apply`: jalankan `sudo btdualboot --restore FILE` dengan file backup yang ditampilkan, lalu coba `sudo btdualboot --apply --reverse-irk`.
+
+---
+
 ## Perintah yang berguna
 
 | Perintah | Menampilkan |

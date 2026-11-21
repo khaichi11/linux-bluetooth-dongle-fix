@@ -13,6 +13,7 @@ Should work on Ubuntu, Debian, Linux Mint, Pop!_OS, Fedora, Arch and any distro 
 - Your **BLE keyboard/mouse doesn't show up** when scanning, or it **connects but doesn't type**.
 - You followed a tutorial that set `ControllerMode = bredr` or added a `btmgmt le on` udev script, and Bluetooth became flaky.
 - You want your Bluetooth setup back in **one command after reinstalling Linux**.
+- You **dual boot Windows and Linux** and have to pair your keyboard/mouse again every time you switch.
 
 ## Quick start
 
@@ -28,7 +29,7 @@ Plug in the dongle **before** installing. The installer:
 1. Finds the built-in Bluetooth chip automatically (a USB Bluetooth device on a `fixed`, i.e. soldered, port) and disables it with a udev rule. It stays off after every reboot.
 2. Sets `ControllerMode = dual` in `/etc/bluetooth/main.conf` so Classic **and** Low Energy both work.
 3. Retires old udev hacks that run `btmgmt`/`hciconfig` (they race with `bluetoothd`).
-4. Installs two helper commands: `btinternal` and `btpairing`.
+4. Installs three helper commands: `btinternal`, `btpairing` and `btdualboot`.
 
 Everything is backed up to `/var/backups/bt-dongle-fix/`. Undo it all with `sudo ./uninstall.sh`.
 
@@ -47,6 +48,9 @@ sudo ./install.sh --internal VID:PID
 | `sudo btinternal off` | Turn it off again |
 | `sudo btpairing backup [FILE]` | Save all pairings (keys) to a private `.tar.gz` |
 | `sudo btpairing restore FILE` | Restore pairings, e.g. after reinstalling Linux |
+| `sudo btdualboot` | Preview copying pairing keys from Windows (dual boot); changes nothing |
+| `sudo btdualboot --apply` | Copy them, so devices work in both Windows and Linux without re-pairing |
+| `sudo btdualboot --restore FILE` | Undo `--apply` from its automatic backup |
 
 ## After reinstalling Linux
 
@@ -68,6 +72,37 @@ sudo btpairing restore ~/bt-pairing.tar.gz
 Pairing keys are tied to the dongle's MAC address, so restoring works as long as you use the **same dongle**.
 
 > **Warning:** The pairing archive contains encryption keys. Never commit it or upload it anywhere public. `.gitignore` already blocks `bt-pairing*.tar.gz`.
+
+## Dual boot with Windows: pair once, use in both
+
+A Bluetooth device keeps **one** pairing key per computer. Windows and Linux on the same machine look like one computer (same dongle, same MAC) but each makes its own key, so pairing in one system breaks the other. `btdualboot` copies the keys Windows made into Linux, so both systems use the same key.
+
+It only **reads** the Windows registry (the Windows partition can stay read-only) and changes nothing but the pairing files in `/var/lib/bluetooth`, which it backs up first.
+
+1. **Linux:** pair your devices as usual. Don't remove them later, `btdualboot` updates these entries.
+2. **Windows:** pair the same devices again (remove old entries for them first). Then shut down fully: disable Fast Startup (*Control Panel > Power Options > Choose what the power buttons do*), or hold **Shift** while clicking **Shut down**.
+3. **Linux:** the devices won't connect yet, which is expected. Run:
+
+```bash
+sudo btdualboot            # preview: lists each device and what would change
+sudo btdualboot --apply    # write (backup first, restarts bluetooth)
+```
+
+Not installed with `install.sh`? Run it straight from the repo: `sudo ./bin/btdualboot`. It needs only Python 3.
+
+The Windows partition is found automatically: it is mounted read-only if needed. Otherwise pass `--hive /path/to/Windows/System32/config/SYSTEM`.
+
+**BLE mice/keyboards often get a new address on every pairing.** The preview then says `NOT PAIRED IN LINUX` and suggests the matching Linux entry:
+
+```
+[BLE] AA:BB:CC:DD:EE:02  (adapter 11:22:33:44:55:66)  ->  NOT PAIRED IN LINUX
+    Probably the same device in Linux: AA:BB:CC:DD:EE:01 "My Mouse"
+    -> run again with:  --map AA:BB:CC:DD:EE:02=AA:BB:CC:DD:EE:01
+```
+
+Add that `--map` to the `--apply` command. If one device shows up several times, Windows kept old pairings: remove the device in Windows, pair it once, and run the preview again.
+
+Use the **same dongle** in both systems. Keys are tied to the adapter's MAC, so a device paired to the built-in Bluetooth in Windows can't be moved to the dongle in Linux. Pair again in either system later? Repeat steps 2-3.
 
 ## Pairing a BLE keyboard properly
 
